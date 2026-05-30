@@ -94,6 +94,10 @@ def parse_args():
     p.add_argument("--filter-augmented", action="store_true", default=True)
     p.add_argument("--alpha", type=float, default=0.05)
     p.add_argument("--label-dim-ratio", type=float, default=0.05)
+    p.add_argument("--min-collisions", type=int, default=2,
+                   help="Keep only candidates colliding in >= this many tables. "
+                        "Prunes weak singletons to speed up rerank (higher QPS) "
+                        "while retaining true neighbours. 1 = original behaviour.")
 
     # --- Misc ---
     p.add_argument("--seed", type=int, default=42)
@@ -171,6 +175,7 @@ def main():
         "alpha": args.alpha,
         "label_dim_ratio": args.label_dim_ratio,
         "n_labels": args.n_labels,
+        "min_collisions": args.min_collisions,
     }
     post = PostFilterSearch(
         base_vecs,
