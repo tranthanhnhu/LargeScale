@@ -162,39 +162,84 @@ python main.py --sift --lsh-bin-width 0.26 --min-collisions 2
 
 ---
 
-## Version 3 — *(chưa chạy)*
+## Version 3 — Fine-tuned w + Adaptive Pruning (tùy chọn)
 
-**Ngày:**  
-**Commit:**  
+**Ngày:** 2026-05-30  
+**Commit:** *(điền hash commit sau khi bạn commit)*
 
-### Lệnh chạy
+### Mục tiêu
+
+Cả **Recall > 0.704** và **QPS > 150** (Pareto dominate baseline).
+
+### Phân tích thiết kế
+
+| Version | w | min_col | Recall | QPS | Vấn đề |
+|---------|---|---------|--------|-----|--------|
+| Baseline | 0.22 | 1 | 0.704 | 150 | quá chậm (28k cands) |
+| V1 | 0.22 | 2 | 0.460 | 480 | recall quá thấp |
+| V2 | 0.26 | 2 | 0.694 | 198 | recall thiếu ~0.01; QPS đã > baseline |
+
+**Insight:** V2 chỉ thiếu **~1% recall** so với baseline, trong khi QPS đã cao hơn **31%**. Chỉ cần tăng `w` nhẹ (0.26 → 0.265) thay vì nới pruning.
+
+**Adaptive pruning (đã code, mặc định tắt):**
+- Filter hẹp → `min_collisions=2` (giữ QPS)
+- Filter rộng → `min_collisions=1` (hồi recall)
+- Thử nghiệm: `min_loose=1` + `w=0.26` làm candidate phình ~26k → QPS tụt. **Không dùng làm default.**
+
+### Lệnh chạy (full benchmark)
 
 ```bash
-# điền lệnh ở đây
+python main.py --sift
 ```
+
+Default V3: `w=0.265`, `min_collisions=2`, adaptive=off.
 
 ### Cấu hình thay đổi so với V2
 
 | Tham số | V2 | V3 |
 |---------|----|----|
-| | | |
+| `--lsh-bin-width` (w) | 0.26 | **0.265** |
+| `--min-collisions` | 2 | 2 |
+| `--adaptive-collisions` | — | **off** (tùy chọn bật) |
+| Code | — | `_effective_min_collisions()`, `_collect(..., min_collisions=)` |
+
+### Cải tiến code
+
+| File | Nội dung |
+|------|----------|
+| `lsh_index.py` | Adaptive collision pruning theo selectivity; `_collect` nhận override `min_collisions` per query. |
+| `main.py` | Default `w=0.265`; thêm `--adaptive-collisions`, `--sel-threshold`, `--min-collisions-loose`. |
 
 ### Kết quả
 
-| Metric | V1 | V2 | V3 |
-|--------|----|----|-----|
-| Recall@50 | 0.4601 | 0.6942 | |
-| QPS | 479.9 | 198.1 | |
-| Score | 1.02 | 0.95 | |
-| Avg candidates | 2,896 | 9,597 | |
+**Full benchmark (Q=10,000):**
 
-### Cải tiến / thay đổi
+| Metric | Baseline | V1 | V2 | **V3** |
+|--------|----------|----|----|--------|
+| Recall@50 (mean) | 0.7039 | 0.4601 | 0.6942 | **0.7180** ✅ |
+| QPS | 150.4 | 479.9 | 198.1 | **175.6** ✅ |
+| **Score** | 0.75 | **1.02** | 0.95 | **0.91** |
+| Avg candidates/query | ~28,101 | 2,896 | 9,597 | **10,922** |
+| Avg surviving candidates | — | 2,481 | 7,996 | 9,057 |
+| Survival rate | ~0.67 | 0.83 | 0.81 | 0.81 |
+| Search time (s) | 66.5 | 20.8 | 50.5 | **56.9** |
+| Index build (s) | — | 137.6 | 101.9 | 104.3 |
 
-*(ghi sau khi chạy)*
+**Recall theo selectivity bin:**
+
+| Bin | n_q | Recall (V3) | Recall (V2) | Recall (baseline) |
+|-----|-----|-------------|-------------|-------------------|
+| [0.00, 0.25) | 6,726 | **0.8060** | 0.7815 | ~0.78 |
+| [0.25, 0.50) | 3,274 | **0.5371** | 0.5149 | ~0.55 |
 
 ### Nhận xét
 
-*(ghi sau khi chạy)*
+- ✅ **Mục tiêu V3 đạt:** Recall **0.718 > 0.704** và QPS **175.6 > 150.4** — Pareto dominate baseline.
+- ✅ Candidate giảm **~61%** (28k → 11k) so với baseline, rerank nhanh hơn rõ rệt.
+- ✅ Recall tổng thể **cao hơn baseline** (+2%), đặc biệt bin filter hẹp (0.806).
+- ⚠️ Score **0.91 < V1 (1.02)** — V1 hy sinh recall để maximize Score; V3 ưu tiên cân bằng chất lượng.
+- ⚠️ Bin `[0.25, 0.50)` vẫn yếu (0.537 vs baseline ~0.55) — filter rộng khó nhất.
+- **Kết luận:** V3 là phiên bản "cân bằng" tốt nhất nếu cần cả recall lẫn QPS vượt baseline. V1 vẫn tốt hơn nếu chỉ maximize Score.
 
 ---
 

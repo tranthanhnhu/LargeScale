@@ -19,6 +19,12 @@ candidates that appear in at least `min_collisions` tables we discard the
 low-quality singletons, shrinking the rerank set sharply (higher QPS) while
 retaining the true neighbours (recall preserved). `min_collisions = 1`
 reproduces the original behaviour exactly.
+
+Optional — SELECTIVITY-ADAPTIVE PRUNING
+---------------------------------------
+Broad-filter queries (selectivity >= sel_threshold) can use a looser
+min_collisions_loose value. Disabled by default: min_loose=1 at wide w
+inflates candidates and hurts QPS. Enable via --adaptive-collisions.
 """
 
 from math import sqrt
@@ -47,6 +53,9 @@ class E2LSH_optimized:
         n_labels            : int    - number of distinct label values
         min_collisions      : int    - keep only candidates seen in >= this many
                                        tables (1 = original union, no pruning)
+        adaptive_collisions : bool   - per-query threshold from filter selectivity
+        sel_threshold       : float  - selectivity >= this uses min_collisions_loose
+        min_collisions_loose: int    - pruning level for broad-filter queries
     """
 
     def __init__(self,
@@ -65,16 +74,21 @@ class E2LSH_optimized:
 
         # filter-augmented params
         self._is_filter_aug = filter_aug_params.get("is_filter_augmented")
+        self.n_labels = int(filter_aug_params.get("n_labels", 1))
         self.label_dim = int(filter_aug_params.get("label_dim_ratio") * dim)
         aug_dim = dim + self.label_dim if self._is_filter_aug else dim
         if self._is_filter_aug:
             alpha = filter_aug_params.get("alpha")
-            self.n_labels = filter_aug_params.get("n_labels")
             self._sqrt_alpha = sqrt(alpha)
             self._sqrt_1_alpha = sqrt(1 - alpha)
 
         # candidate pruning: keep candidates colliding in >= min_collisions tables
         self.min_collisions = int(filter_aug_params.get("min_collisions", 1))
+        self.adaptive_collisions = bool(
+            filter_aug_params.get("adaptive_collisions", False))
+        self.sel_threshold = float(filter_aug_params.get("sel_threshold", 0.25))
+        self.min_collisions_loose = int(
+            filter_aug_params.get("min_collisions_loose", 1))
 
         rng = np.random.default_rng(seed)
 
@@ -134,7 +148,16 @@ class E2LSH_optimized:
     # Internal: candidate collection
     # ------------------------------------------------------------------
 
-    def _collect(self, parts: list) -> np.ndarray:
+    def _effective_min_collisions(self, lo: int, hi: int) -> int:
+        """Broad filters need looser pruning to recover recall."""
+        if not self.adaptive_collisions:
+            return self.min_collisions
+        sel = (hi - lo + 1) / self.n_labels
+        if sel >= self.sel_threshold:
+            return self.min_collisions_loose
+        return self.min_collisions
+
+    def _collect(self, parts: list, min_collisions: int | None = None) -> np.ndarray:
         """
         Union the per-table bucket arrays.
 
@@ -142,6 +165,7 @@ class E2LSH_optimized:
         Otherwise only candidates appearing in at least `min_collisions`
         tables are kept (collision-frequency pruning).
         """
+        mc = self.min_collisions if min_collisions is None else min_collisions
         if not parts:
             return np.array([], dtype=np.int32)
 
@@ -150,7 +174,7 @@ class E2LSH_optimized:
         if len(cat) == 0:
             return cat
 
-        if self.min_collisions <= 1:
+        if mc <= 1:
             mask = np.empty(len(cat), dtype=bool)
             mask[0] = True
             mask[1:] = cat[1:] != cat[:-1]
@@ -161,7 +185,7 @@ class E2LSH_optimized:
             np.concatenate(([True], cat[1:] != cat[:-1], [True])))
         counts = np.diff(boundaries)
         vals = cat[boundaries[:-1]]
-        return vals[counts >= self.min_collisions]
+        return vals[counts >= mc]
 
     # ------------------------------------------------------------------
     # Build
@@ -206,7 +230,8 @@ class E2LSH_optimized:
             bucket = self.tables[t].get(int(keys[t]))
             if bucket is not None:
                 parts.append(bucket)
-        return self._collect(parts)
+        mc = self._effective_min_collisions(lo, hi)
+        return self._collect(parts, min_collisions=mc)
 
     # ------------------------------------------------------------------
     # Batch query  (one big matmul for all queries)
@@ -226,7 +251,9 @@ class E2LSH_optimized:
                 bucket = self.tables[t].get(int(keys[t]))
                 if bucket is not None:
                     parts.append(bucket)
-            results.append(self._collect(parts))
+            lo, hi = int(filter_range[q_idx, 0]), int(filter_range[q_idx, 1])
+            mc = self._effective_min_collisions(lo, hi)
+            results.append(self._collect(parts, min_collisions=mc))
 
         return results
 
