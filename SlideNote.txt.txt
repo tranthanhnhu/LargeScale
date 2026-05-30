@@ -1,0 +1,88 @@
+Slide 1
+Hello everyone. Today I am going to introduce the term project, which is about Filtered Approximate Nearest Neighbor Search, or Filtered ANNS.
+
+Slide 2
+Here are the two main references for this project. These papers provide the background and motivation for filtered vector search and help us understand the design space of filtered ANNS methods.
+
+Slide 4
+So, what is filtered vector search? In filtered vector search, we do not search over the entire database. Instead, we first apply some relational filters to restrict which data points are eligible for retrieval. For example, suppose you are looking for papers on filtered vector search. You type a keyword into Google Scholar, but the results may include older papers. To narrow them down, you can set a date range to exclude those older papers. This is one example of filtered vector search in practice.
+So the search is based not only on vector similarity, but also on whether each data point satisfies the filter condition.
+
+Slide 5
+The main challenge in filtered ANNS is that applying a filter changes both the size and the distribution of the searchable data points.
+Suppose we have many data points, a query, and its three nearest neighbors. This is the typical setting in ANNS.
+But once we apply a filter, the set of searchable points becomes smaller, and the nearest neighbors may be very different from those in the original full dataset. And the distribution may also change significantly.
+Ideally, a filter-aware index should behave as if it were built only on the data points that satisfy the filter.
+
+Slide 6
+This slide shows the same idea with a different filter.
+When we change the filter, the subset of qualified vectors changes again, and the local neighborhood structure around the query also changes. This means that a standard ANN index built for the full dataset may not be well aligned with the filtered search space. That is why filtered ANNS is more difficult than ordinary ANN search.
+So how to solve this problem?
+
+Slide 8
+The first baseline is pre-filtering.
+The idea is straightforward. We first apply the filter to the dataset and keep only the qualified vectors. Then, we perform KNN search on this filtered subset.
+This gives us the exact ground truth, because the KNN search is done directly on the correct candidate set. However, it can be slow, especially when we have to rerank all the qualified vectors.
+
+Slide 9
+The second baseline is post-filtering. In this approach, we first perform ANN search on the full dataset (in this term project, we use LSH).
+After retrieving the candidates, we then apply the filter and keep only those that satisfy the condition. This is usually faster than pre-filtering, because the ANN search is efficient. But the downside is that many retrieved candidates may not survive the filter, which hurts the final retrieval quality.
+
+Slide 10
+This slide highlights the main weakness of post-filtering. Traditional ANNS methods only care about vector similarity, so many retrieved candidates do not satisfy the filter. As a result, a large portion of the candidates are wasted. In this example, around 80 percent of them are discarded after filtering. This means we spend computation on points that are not actually useful for the filtered search task.
+So even if post-filtering is fast, its recall can become quite poor.
+
+Slide 11
+A better idea is inline-filtering, also called joint-filtering. Instead of separating filtering and vector search into two stages, we combine them into the same process.
+That means filtering is considered during both indexing and searching. In other words, the index is built with both vector information and attribute information, and the query is also transformed in a way that reflects both similarity and filter constraints.
+This allows the search process to generate candidates that are more likely to be both similar and filter-compatible.
+
+Slide 12
+Before introducing the filter-augmented version, let me briefly review Euclidean LSH.
+In Euclidean LSH, we hash each vector using a random projection (w), plus an offset (b), and then divide by a bin width (r). The intuition is that vectors that are close in Euclidean space are more likely to fall into the same hash bucket.
+This makes approximate nearest neighbor search much faster, because we only need to compare points in relevant buckets instead of scanning the entire dataset.
+
+Slide 13
+Now we extend standard LSH to filter-augmented LSH. The key idea is to build an augmented vector, denoted as x-prime, by concatenating two parts.
+The first part is the original vector scaled by alpha, and the second part is the attribute representation scaled by one minus alpha.
+This way, the hash function considers both the vector embedding and the filter-related label information. So similar vectors with compatible attributes are more likely to be hashed together.
+This is how we incorporate filtering directly into the ANN indexing framework.
+Note that the attribute representation is a k-dimensional vector, where each element is the same label scalar.
+
+Slide 14
+Here, we compare the candidate statistics with and without filter augmentation.
+The key point is that filter-augmented LSH produces fewer wasted candidates while achieving better retrieval quality. In particular, the average survival rate improves from 20 percent to 44 percent. This means that a much larger portion of the retrieved candidates remains valid after filtering. As a result, the search becomes more efficient and better aligned with the actual goal of filtered retrieval.
+
+Slide 15
+Finally, we compare the overall performance.
+With filter augmentation, the method achieves higher recall while remaining 3.43 times faster than the pre-filtering baseline. Compared with pre-filtering, it preserves much of the efficiency advantage of ANN search while also improving filtered retrieval quality.
+This is exactly the trade-off we want in filtered ANNS: high recall with high throughput.
+
+Slide 16
+The dataset for this term project is SIFT dataset with random generated label.
+For the database, we have one million vectors, each with dimension 128. For the test set, there are ten thousand queries, again with 128-dimensional vectors.
+Each base vector is assigned a label sampled from a normal distribution, and the label is stored as an integer in the range from 0 to 1000. For each query, the filter is defined as a label range, where the normalized filter width is between 0.005 and 0.4.
+
+Slide 17
+Here is an example of how to use the code from the README file. To run the SIFT experiment, you first set up the environment and then run python main.py --sift. Please make sure to include the --sift argument; otherwise, you will use the wrong dataset, which is randomly generated.
+And the file we will be working on is lsh_index.py.
+
+Slide 18
+Here, we connect the mathematical formulation to the actual implementation in lsh_index.py.
+The _compute_keys function corresponds to the hash function h(), and vecs corresponds to the augmented vector x′. The first line computes the projection, which multiplies x' by random matrix w and adds a random offset b. The second line computes the hash key for x′ by dividing the projection by the bin width r and then applying the floor function.
+
+Slide 19
+Here is how we construct the augmented vector x′.
+For indexing, each base vector is augmented using its label vector, where the label scalar is broadcast to a k-dimensional vector. For searching, each query is augmented using the midpoint of its filter range, which is also broadcast to a k-dimensional vector.
+
+Slide 20
+Here is the baseline performance with the default configuration.
+The table compares pre-filtering and post-filtering in terms of recall and QPS. As expected, pre-filtering gives very strong recall, but it is much slower. Post-filtering is significantly faster, but its recall is much lower.
+This result motivates the project: we want to design a better filtered ANNS method that improves this trade-off.
+
+Slide 21
+Finally, here is the term project requirement.
+Your task is to design a filtered ANNS method that maximizes the final score, which is defined as QPS divided by 100, multiplied by Recall squared. In this formula, QPS stands for queries per second, and R denotes Recall@50. Your goal is to get closer to this area.
+Each group should consist of two students.
+Please submit your code before June 2, because we need to measure QPS. For a fair comparison, QPS must be measured on the same machine.
+After I evaluate all group scores, I will announce the final results on eCourse2. Please include your final score in your slides.
