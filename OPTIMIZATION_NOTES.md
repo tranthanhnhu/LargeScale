@@ -243,6 +243,65 @@ Default V3: `w=0.265`, `min_collisions=2`, adaptive=off.
 
 ---
 
-## Version 4 — *(dự phòng)*
+## Version 4 — Singleton backfill cho filter rộng ✅
 
-*(copy template từ V3 khi cần)*
+**Ngày:** 2026-05-30  
+**Commit:** *(điền hash commit sau khi bạn commit)*
+
+### Vấn đề
+
+- V3: R=0.718, QPS=175.6, Score=0.91 — cả R và QPS > baseline.
+- V1: Score=1.02 nhưng R=0.46 — **loại** (recall giảm quá nhiều).
+- Bin yếu V3: filter rộng `[0.25, 0.50)` recall chỉ **0.537**.
+
+### Cải tiến code
+
+**Singleton backfill có cap** — chỉ filter rộng (selectivity ≥ 0.25):
+
+1. Giữ mọi candidate va ≥ 2 tables.
+2. Filter rộng: thêm singleton (va 1 table) đến cap `max_candidates=13000`.
+3. Filter hẹp: không thêm singleton → giữ QPS.
+
+### Lệnh chạy
+
+```bash
+python main.py --sift
+```
+
+Default V4: `w=0.268`, `min_collisions=2`, `adaptive=on`, `max_candidates=13000`.
+
+### Cấu hình
+
+| Tham số | V3 | V4 |
+|---------|----|----|
+| `w` | 0.265 | **0.268** |
+| `min_collisions` | 2 | 2 |
+| `adaptive_collisions` | off | **on** |
+| `max_candidates` | — | **13000** |
+
+### Kết quả full (Q=10,000)
+
+| Metric | Baseline | V3 | **V4** |
+|--------|----------|----|--------|
+| Recall@50 (mean) | 0.7039 | 0.7180 | **0.7350** ✅ |
+| QPS | 150.4 | 187.4 | **194.6** ✅ |
+| **Score** | 0.75 | 0.97 | **1.05** ✅ |
+| Avg candidates/query | ~28,101 | 10,922 | 12,569 |
+| Search time (s) | 66.5 | 53.4 | **51.4** |
+
+**Recall theo selectivity bin:**
+
+| Bin | n_q | V3 | **V4** |
+|-----|-----|----|--------|
+| [0.00, 0.25) | 6,726 | 0.8060 | **0.8194** |
+| [0.25, 0.50) | 3,274 | 0.5371 | **0.5616** |
+
+### Nhận xét
+
+- ✅ **Beat V3 trên mọi metric:** Recall +1.7%, QPS +3.8%, Score +8%.
+- ✅ **Beat V1 Score** (1.05 vs 1.02) mà recall vẫn cao (0.735 vs 0.46).
+- ✅ Cả Recall và QPS đều > baseline — Pareto dominate.
+- ✅ Broad bin cải thiện rõ (+0.025) nhờ singleton backfill.
+- **Kết luận:** V4 là version tốt nhất hiện tại — đã set làm default.
+
+---

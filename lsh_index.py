@@ -20,11 +20,13 @@ low-quality singletons, shrinking the rerank set sharply (higher QPS) while
 retaining the true neighbours (recall preserved). `min_collisions = 1`
 reproduces the original behaviour exactly.
 
-Optional — SELECTIVITY-ADAPTIVE PRUNING
----------------------------------------
-Broad-filter queries (selectivity >= sel_threshold) can use a looser
-min_collisions_loose value. Disabled by default: min_loose=1 at wide w
-inflates candidates and hurts QPS. Enable via --adaptive-collisions.
+Optional — SELECTIVITY-ADAPTIVE SINGLETON BACKFILL
+-------------------------------------------------
+Broad-filter queries (selectivity >= sel_threshold) miss more true
+neighbours under min_collisions pruning.  For those queries only, after
+keeping all count >= min_collisions candidates, fill up to max_candidates
+with count == 1 singletons.  Selective queries stay strictly pruned (fast).
+This targets the weak [0.25, 0.50) recall bin without inflating every query.
 """
 
 from math import sqrt
@@ -53,9 +55,10 @@ class E2LSH_optimized:
         n_labels            : int    - number of distinct label values
         min_collisions      : int    - keep only candidates seen in >= this many
                                        tables (1 = original union, no pruning)
-        adaptive_collisions : bool   - per-query threshold from filter selectivity
-        sel_threshold       : float  - selectivity >= this uses min_collisions_loose
-        min_collisions_loose: int    - pruning level for broad-filter queries
+        adaptive_collisions : bool   - broad-filter singleton backfill (see above)
+        sel_threshold       : float  - selectivity >= this triggers backfill
+        max_candidates      : int    - cap total candidates when backfill is on
+                                       (0 = no cap)
     """
 
     def __init__(self,
@@ -87,8 +90,7 @@ class E2LSH_optimized:
         self.adaptive_collisions = bool(
             filter_aug_params.get("adaptive_collisions", False))
         self.sel_threshold = float(filter_aug_params.get("sel_threshold", 0.25))
-        self.min_collisions_loose = int(
-            filter_aug_params.get("min_collisions_loose", 1))
+        self.max_candidates = int(filter_aug_params.get("max_candidates", 0))
 
         rng = np.random.default_rng(seed)
 
@@ -148,44 +150,63 @@ class E2LSH_optimized:
     # Internal: candidate collection
     # ------------------------------------------------------------------
 
-    def _effective_min_collisions(self, lo: int, hi: int) -> int:
-        """Broad filters need looser pruning to recover recall."""
+    def _collect_params(self, lo: int, hi: int) -> dict:
+        """Per-query collection strategy."""
+        params = {
+            "min_collisions": self.min_collisions,
+            "singleton_backfill": False,
+            "max_candidates": 0,
+        }
         if not self.adaptive_collisions:
-            return self.min_collisions
+            return params
         sel = (hi - lo + 1) / self.n_labels
-        if sel >= self.sel_threshold:
-            return self.min_collisions_loose
-        return self.min_collisions
+        if sel >= self.sel_threshold and self.max_candidates > 0:
+            params["singleton_backfill"] = True
+            params["max_candidates"] = self.max_candidates
+        return params
 
-    def _collect(self, parts: list, min_collisions: int | None = None) -> np.ndarray:
+    def _collect(self, parts: list, min_collisions: int | None = None,
+                 singleton_backfill: bool = False,
+                 max_candidates: int = 0) -> np.ndarray:
         """
-        Union the per-table bucket arrays.
+        Union per-table bucket arrays with optional collision pruning.
 
-        If min_collisions <= 1 this is the original concat+sort+diff dedup.
-        Otherwise only candidates appearing in at least `min_collisions`
-        tables are kept (collision-frequency pruning).
+        min_collisions <= 1 without backfill: original dedup.
+        min_collisions >= 2: keep ids seen in >= mc tables.
+        singleton_backfill: for broad filters, add count==1 ids up to cap.
         """
         mc = self.min_collisions if min_collisions is None else min_collisions
         if not parts:
             return np.array([], dtype=np.int32)
 
-        cat = np.concatenate(parts)   # int32, contiguous
-        cat.sort()                    # in-place radix/merge sort
+        cat = np.concatenate(parts)
+        cat.sort()
         if len(cat) == 0:
             return cat
 
-        if mc <= 1:
+        if mc <= 1 and not singleton_backfill:
             mask = np.empty(len(cat), dtype=bool)
             mask[0] = True
             mask[1:] = cat[1:] != cat[:-1]
             return cat[mask]
 
-        # Run-length count on the sorted array; keep frequent candidates.
         boundaries = np.flatnonzero(
             np.concatenate(([True], cat[1:] != cat[:-1], [True])))
         counts = np.diff(boundaries)
         vals = cat[boundaries[:-1]]
-        return vals[counts >= mc]
+
+        if mc <= 1:
+            keep = vals
+        else:
+            keep = vals[counts >= mc]
+            if singleton_backfill and max_candidates > len(keep):
+                singles = vals[counts == 1]
+                room = max_candidates - len(keep)
+                if room > 0 and len(singles) > 0:
+                    keep = np.concatenate([keep, singles[:room]])
+                    keep.sort()
+
+        return keep.astype(np.int32)
 
     # ------------------------------------------------------------------
     # Build
@@ -230,8 +251,8 @@ class E2LSH_optimized:
             bucket = self.tables[t].get(int(keys[t]))
             if bucket is not None:
                 parts.append(bucket)
-        mc = self._effective_min_collisions(lo, hi)
-        return self._collect(parts, min_collisions=mc)
+        cp = self._collect_params(lo, hi)
+        return self._collect(parts, **cp)
 
     # ------------------------------------------------------------------
     # Batch query  (one big matmul for all queries)
@@ -252,8 +273,8 @@ class E2LSH_optimized:
                 if bucket is not None:
                     parts.append(bucket)
             lo, hi = int(filter_range[q_idx, 0]), int(filter_range[q_idx, 1])
-            mc = self._effective_min_collisions(lo, hi)
-            results.append(self._collect(parts, min_collisions=mc))
+            cp = self._collect_params(lo, hi)
+            results.append(self._collect(parts, **cp))
 
         return results
 

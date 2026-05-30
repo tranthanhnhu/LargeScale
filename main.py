@@ -83,7 +83,7 @@ def parse_args():
                         "Fewer functions → larger (less specific) buckets, "
                         "higher per-table recall but more false positives. "
                         "For 128-D normalised vectors, K=2 works well.")
-    p.add_argument("--lsh-bin-width", type=float, default=0.265,
+    p.add_argument("--lsh-bin-width", type=float, default=0.268,
                    help="LSH bin width (w) – key recall tuning knob. "
                         "For L2-normalised vectors (unit sphere) use ~0.3-0.8; "
                         "for raw SIFT (values up to 255) use ~50-200.")
@@ -98,15 +98,15 @@ def parse_args():
                    help="Keep only candidates colliding in >= this many tables. "
                         "Prunes weak singletons to speed up rerank (higher QPS) "
                         "while retaining true neighbours. 1 = original behaviour.")
-    p.add_argument("--adaptive-collisions", action="store_true", default=False,
-                   help="Use looser pruning (min-collisions-loose) on broad filters.")
+    p.add_argument("--adaptive-collisions", action="store_true", default=True,
+                   help="Broad filters: backfill singleton candidates up to max-candidates.")
     p.add_argument("--no-adaptive-collisions", action="store_false",
                    dest="adaptive_collisions",
-                   help="Disable selectivity-adaptive collision pruning.")
+                   help="Disable broad-filter singleton backfill.")
     p.add_argument("--sel-threshold", type=float, default=0.25,
-                   help="Selectivity >= this fraction uses min-collisions-loose.")
-    p.add_argument("--min-collisions-loose", type=int, default=1,
-                   help="min_collisions for broad-filter queries when adaptive is on.")
+                   help="Selectivity >= this fraction triggers singleton backfill.")
+    p.add_argument("--max-candidates", type=int, default=13000,
+                   help="Cap candidates for broad-filter queries with backfill (0=no cap).")
 
     # --- Misc ---
     p.add_argument("--seed", type=int, default=42)
@@ -187,7 +187,7 @@ def main():
         "min_collisions": args.min_collisions,
         "adaptive_collisions": args.adaptive_collisions,
         "sel_threshold": args.sel_threshold,
-        "min_collisions_loose": args.min_collisions_loose,
+        "max_candidates": args.max_candidates,
     }
     post = PostFilterSearch(
         base_vecs,
