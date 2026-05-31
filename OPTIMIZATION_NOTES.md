@@ -243,65 +243,264 @@ Default V3: `w=0.265`, `min_collisions=2`, adaptive=off.
 
 ---
 
-## Version 4 — Singleton backfill cho filter rộng ✅
+## Version 4 — Singleton Backfill + Fine-tuned w ✅ (FINAL)
 
 **Ngày:** 2026-05-30  
-**Commit:** *(điền hash commit sau khi bạn commit)*
+**Commit:** *(điền hash commit sau khi bạn commit)*  
+**Trạng thái:** Default trong `main.py` — giám khảo chạy `python main.py --sift`
 
-### Vấn đề
+---
 
-- V3: R=0.718, QPS=175.6, Score=0.91 — cả R và QPS > baseline.
-- V1: Score=1.02 nhưng R=0.46 — **loại** (recall giảm quá nhiều).
-- Bin yếu V3: filter rộng `[0.25, 0.50)` recall chỉ **0.537**.
+### 1. Tóm tắt
 
-### Cải tiến code
+V4 kế thừa **collision-frequency pruning** (V1) và **fine-tuned w** (V3), thêm **singleton backfill có cap** cho filter rộng. Là version tốt nhất: beat baseline, beat V3, beat V1 về Score mà recall vẫn cao.
 
-**Singleton backfill có cap** — chỉ filter rộng (selectivity ≥ 0.25):
+| Metric | Baseline | V1 | V3 | **V4** |
+|--------|----------|----|----|--------|
+| Recall@50 | 0.7039 | 0.4601 ❌ | 0.7180 | **0.7350** |
+| QPS | 150.4 | 479.9 | 187.4 | **~200** |
+| Score | 0.75 | 1.02 | 0.97 | **~1.05–1.12** |
+| R > baseline? | — | ❌ | ✅ | ✅ |
+| QPS > baseline? | — | ✅ | ✅ | ✅ |
 
-1. Giữ mọi candidate va ≥ 2 tables.
-2. Filter rộng: thêm singleton (va 1 table) đến cap `max_candidates=13000`.
-3. Filter hẹp: không thêm singleton → giữ QPS.
+---
 
-### Lệnh chạy
+### 2. Vấn đề cần giải (từ V3)
+
+- V3 đạt Pareto dominate baseline (R=0.718, QPS=175.6) nhưng Score 0.91 < V1 (1.02).
+- V1 Score cao (1.02) nhưng Recall 0.46 — **không chấp nhận** (hy sinh recall quá nhiều).
+- **Bin yếu nhất:** filter rộng `[0.25, 0.50)` — recall chỉ **0.537** (V3), kéo recall tổng xuống.
+- Nguyên nhân: `min_collisions=2` loại các true neighbour chỉ va **1 bảng** — hay xảy ra hơn khi filter rộng (nhiều vector eligible, LSH khó phân biệt).
+
+---
+
+### 3. Giải pháp V4 — Singleton Backfill có cap
+
+**Ý tưởng:** Không nới pruning cho mọi query (V4 cũ thử `min_loose=1` → 757k candidates, thất bại). Chỉ **bổ sung singleton** cho query filter rộng, có **cap cứng**.
+
+**Luồng xử lý mỗi query:**
+
+```
+1. Probe L=400 hash tables → thu bucket candidates
+2. Đếm collision count per candidate id (run-length trên mảng sorted)
+3. Luôn giữ: count >= min_collisions (2)
+4. Nếu selectivity >= 0.25 (filter rộng):
+     → thêm count == 1 (singleton) cho đến max_candidates = 13000
+   Ngược lại (filter hẹp, ~67% queries):
+     → KHÔNG thêm singleton → giữ QPS cao
+5. Post-filter (label) + exact L2 rerank top-50
+```
+
+**Tại sao hiệu quả:**
+- Filter **hẹp** (67% queries): recall đã cao (0.806 V3) → strict pruning đủ.
+- Filter **rộng** (33% queries): true neighbour hay bị loại vì chỉ va 1 bảng → backfill cứu recall (+0.025 broad bin).
+- Cap 13000 ngăn candidate phình như baseline (~28k) → QPS vẫn > baseline.
+
+---
+
+### 4. Thay đổi hyperparameter (so với V3)
+
+| Tham số | CLI flag | Baseline | V3 | **V4** |
+|---------|----------|----------|----|--------|
+| Hash tables L | `--lsh-tables` | 400 | 400 | **400** |
+| Hash functions K | `--lsh-functions` | 5 | 5 | **5** |
+| Bin width w | `--lsh-bin-width` | 0.22 | 0.265 | **0.268** |
+| Alpha | `--alpha` | 0.05 | 0.05 | **0.05** |
+| Label dim ratio | `--label-dim-ratio` | 0.05 | 0.05 | **0.05** |
+| Min collisions | `--min-collisions` | 1 | 2 | **2** |
+| Adaptive backfill | `--adaptive-collisions` | — | off | **on** |
+| Selectivity threshold | `--sel-threshold` | — | — | **0.25** |
+| Max candidates (broad) | `--max-candidates` | — | — | **13000** |
+| Seed | `--seed` | 42 | 42 | **42** |
+
+**Thay đổi so với V3:** `w` 0.265→0.268 (+1.1%), bật adaptive backfill, cap 13000.
+
+---
+
+### 5. Thay đổi code chi tiết
+
+#### 5.1. `lsh_index.py`
+
+**a) Tham số mới trong `E2LSH_optimized.__init__`:**
+
+```python
+self.min_collisions = int(filter_aug_params.get("min_collisions", 1))
+self.adaptive_collisions = bool(filter_aug_params.get("adaptive_collisions", False))
+self.sel_threshold = float(filter_aug_params.get("sel_threshold", 0.25))
+self.max_candidates = int(filter_aug_params.get("max_candidates", 0))
+self.n_labels = int(filter_aug_params.get("n_labels", 1))  # luôn set, dùng cho selectivity
+```
+
+**b) `_collect_params(lo, hi)` — chiến lược per-query:**
+
+```python
+def _collect_params(self, lo, hi):
+    params = {"min_collisions": 2, "singleton_backfill": False, "max_candidates": 0}
+    sel = (hi - lo + 1) / self.n_labels
+    if self.adaptive_collisions and sel >= self.sel_threshold and self.max_candidates > 0:
+        params["singleton_backfill"] = True
+        params["max_candidates"] = self.max_candidates
+    return params
+```
+
+**c) `_collect(parts, ...)` — collision pruning + backfill:**
+
+```python
+# Bước 1: concat tất cả bucket → sort
+# Bước 2: run-length count → vals, counts
+# Bước 3: keep = vals[counts >= min_collisions]
+# Bước 4 (chỉ broad filter):
+#   singles = vals[counts == 1]
+#   room = max_candidates - len(keep)
+#   keep = concat(keep, singles[:room])
+```
+
+**d) `query()` và `batch_query()`:** gọi `_collect_params(lo, hi)` rồi truyền vào `_collect(**cp)`.
+
+**Kế thừa từ V1 (không đổi logic gốc):**
+- Batched matmul projection `(Q × D) @ (L·K × D)ᵀ`
+- Integer bucket keys qua `_coeffs`
+- Filter-augmented vector: `[√α·v, √(1−α)·label/n_labels]`
+
+#### 5.2. `main.py`
+
+**CLI arguments mới:**
+
+| Flag | Default V4 | Mô tả |
+|------|------------|-------|
+| `--min-collisions` | 2 | Pruning: giữ candidate va ≥ N bảng |
+| `--adaptive-collisions` | **True** | Bật singleton backfill cho filter rộng |
+| `--no-adaptive-collisions` | — | Tắt backfill (quay về V3 behaviour) |
+| `--sel-threshold` | 0.25 | Selectivity ≥ ngưỡng này → backfill |
+| `--max-candidates` | 13000 | Cap candidate cho query filter rộng |
+| `--lsh-bin-width` | **0.268** | Tăng nhẹ từ V3 (0.265) |
+
+**`filter_aug_params` truyền vào `PostFilterSearch`:**
+
+```python
+filter_aug_params = {
+    "is_filter_augmented": True,
+    "alpha": 0.05,
+    "label_dim_ratio": 0.05,
+    "n_labels": 1000,
+    "min_collisions": 2,
+    "adaptive_collisions": True,
+    "sel_threshold": 0.25,
+    "max_candidates": 13000,
+}
+```
+
+#### 5.3. `postfilter.py` — không sửa
+
+Pipeline giữ nguyên: `lsh.batch_query()` → label filter → exact L2 rerank top-k.
+
+---
+
+### 6. Lệnh chạy
 
 ```bash
 python main.py --sift
 ```
 
-Default V4: `w=0.268`, `min_collisions=2`, `adaptive=on`, `max_candidates=13000`.
+Tất cả tham số V4 đã baked vào default — không cần flag thêm.
 
-### Cấu hình
+Quay về V3 (nếu cần so sánh):
 
-| Tham số | V3 | V4 |
-|---------|----|----|
-| `w` | 0.265 | **0.268** |
-| `min_collisions` | 2 | 2 |
-| `adaptive_collisions` | off | **on** |
-| `max_candidates` | — | **13000** |
+```bash
+python main.py --sift --lsh-bin-width 0.265 --no-adaptive-collisions
+```
 
-### Kết quả full (Q=10,000)
+---
 
-| Metric | Baseline | V3 | **V4** |
-|--------|----------|----|--------|
-| Recall@50 (mean) | 0.7039 | 0.7180 | **0.7350** ✅ |
-| QPS | 150.4 | 187.4 | **194.6** ✅ |
-| **Score** | 0.75 | 0.97 | **1.05** ✅ |
-| Avg candidates/query | ~28,101 | 10,922 | 12,569 |
-| Search time (s) | 66.5 | 53.4 | **51.4** |
+### 7. Kết quả benchmark (Q=10,000, full SIFT-128)
 
-**Recall theo selectivity bin:**
+#### 7.1. Các lần chạy V4 (cùng code, cùng seed)
 
-| Bin | n_q | V3 | **V4** |
-|-----|-----|----|--------|
-| [0.00, 0.25) | 6,726 | 0.8060 | **0.8194** |
-| [0.25, 0.50) | 3,274 | 0.5371 | **0.5616** |
+| Lần | Recall | QPS | Score | Search time [B] | Index build |
+|-----|--------|-----|-------|-----------------|-------------|
+| 1 | 0.7350 | 194.6 | 1.05 | 51.4s | 75.8s |
+| 2 | 0.7350 | 206.9 | 1.12 | 48.3s | 70.1s |
+| 3 | 0.7350 | 203.1 | 1.10 | 49.2s | 74.1s |
+| **Trung bình** | **0.7350** | **~201** | **~1.09** | **~49.6s** | **~73s** |
 
-### Nhận xét
+**Lưu ý QPS:**
+- **Recall luôn 0.7350** — deterministic (cùng seed=42, cùng thuật toán).
+- **QPS dao động ±5–7%** giữa các lần chạy — do CPU load, cache, OS scheduling.
+- Chỉ **phần [B] PostFilter search time** tính vào QPS Score; phần [A] Pre-filter (~460–590s) **không** ảnh hưởng Score.
 
-- ✅ **Beat V3 trên mọi metric:** Recall +1.7%, QPS +3.8%, Score +8%.
-- ✅ **Beat V1 Score** (1.05 vs 1.02) mà recall vẫn cao (0.735 vs 0.46).
-- ✅ Cả Recall và QPS đều > baseline — Pareto dominate.
-- ✅ Broad bin cải thiện rõ (+0.025) nhờ singleton backfill.
-- **Kết luận:** V4 là version tốt nhất hiện tại — đã set làm default.
+#### 7.2. So sánh chi tiết V4 vs V3 (lần chạy đại diện)
+
+| Metric | Baseline | V3 | **V4** | Δ vs baseline |
+|--------|----------|----|--------|---------------|
+| Recall@50 (mean) | 0.7039 | 0.7180 | **0.7350** | **+4.4%** |
+| Recall@50 (median) | 1.0000 | 0.7400 | **0.7600** | — |
+| QPS | 150.4 | 187.4 | **~201** | **+34%** |
+| **Score** | 0.75 | 0.97 | **~1.09** | **+45%** |
+| Avg candidates/query | ~28,101 | 10,922 | **12,569** | −55% |
+| Avg surviving candidates | — | 9,057 | **10,388** | — |
+| Survival rate | ~0.67 | 0.81 | **0.80** | — |
+| Search time [B] (s) | 66.5 | 53.4 | **~49.6** | −25% |
+| Index build (s) | — | 104.3 | **~73** | — |
+| avg buckets/table | ~68,811 | 36,357 | **34,968** | — |
+
+#### 7.3. Recall theo selectivity bin
+
+| Bin | n_q | Baseline | V3 | **V4** |
+|-----|-----|----------|----|--------|
+| [0.00, 0.25) filter hẹp | 6,726 | ~0.78 | 0.8060 | **0.8194** |
+| [0.25, 0.50) filter rộng | 3,274 | ~0.55 | 0.5371 | **0.5616** |
+
+Broad bin cải thiện **+0.024** nhờ singleton backfill — đúng mục tiêu thiết kế.
+
+---
+
+### 8. Diễn giải Score
+
+```
+Score = (QPS / 100) × Recall²
+
+V4 (QPS=201, R=0.735):
+  = 2.01 × 0.5402 = 1.09
+
+Baseline (QPS=150, R=0.704):
+  = 1.50 × 0.4955 = 0.75  (+45%)
+
+V1 (QPS=480, R=0.460) — bị loại vì recall thấp:
+  = 4.80 × 0.2116 = 1.02  (Score cao nhưng R=0.46 không chấp nhận)
+```
+
+V4 beat V1 Score (~1.09 vs 1.02) **và** giữ recall cao (0.735 vs 0.46).
+
+---
+
+### 9. Evolution tóm tắt (V1 → V4)
+
+```
+Baseline (w=0.22, min_col=1)
+  │  28k cands, R=0.70, QPS=150, Score=0.75
+  ▼
+V1: + collision-frequency pruning (min_col=2)
+  │  2.9k cands, R=0.46↓, QPS=480↑, Score=1.02 — recall quá thấp
+  ▼
+V2: + tăng w=0.26
+  │  9.6k cands, R=0.69, QPS=198, Score=0.95 — gần baseline R
+  ▼
+V3: + fine-tune w=0.265
+  │  10.9k cands, R=0.718✅, QPS=176✅, Score=0.91 — cân bằng tốt
+  ▼
+V4: + singleton backfill (broad filter) + w=0.268
+     12.6k cands, R=0.735✅, QPS=~201✅, Score=~1.09✅ — FINAL
+```
+
+---
+
+### 10. Kết luận
+
+- ✅ **Version nộp bài:** V4 — `python main.py --sift`
+- ✅ Recall **0.735** (+4.4% vs baseline), QPS **~200** (+34% vs baseline)
+- ✅ Score **~1.09** (dao động 1.05–1.12 tùy máy)
+- ✅ Beat V1 Score mà không hy sinh recall
+- ✅ Code thay đổi: `lsh_index.py` (pruning + backfill), `main.py` (CLI defaults)
+- ⚠️ QPS báo cáo nên ghi **~200 ± 10**; Recall báo **0.735** (cố định)
 
 ---
